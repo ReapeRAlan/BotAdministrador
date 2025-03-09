@@ -1,4 +1,4 @@
-TOKEN = "7162007458:AAF_4AnWVD73-1NNKWmniLyNeW_S2IyqE2s"
+TOKEN = ":C"
 DATABASE_PATH = "data/database.db"
 # config.py
 OLLAMA_API_URL = "http://192.168.100.70:11434"
