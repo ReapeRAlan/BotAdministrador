@@ -6,12 +6,13 @@ import tempfile
 import pandas as pd
 import sqlite3
 from datetime import datetime, date
+import matplotlib.pyplot as plt  # Se usa para generar gráficas
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -20,7 +21,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
     ConversationHandler,
-    CallbackQueryHandler
+    CallbackQueryHandler,
 )
 from config import TOKEN, DATABASE_PATH
 from database import (
@@ -29,7 +30,7 @@ from database import (
     modificar_transaccion,
     eliminar_transaccion,
     obtener_historial_df,
-    obtener_inventario_df
+    obtener_inventario_df,
 )
 from ollama_integration import analizar_mensaje, ContextManager
 
@@ -43,46 +44,56 @@ logger = logging.getLogger(__name__)
 connect_db()
 
 # -----------------------
-# Registro de usuario por chat
+# Registro de trabajador por chat
 # -----------------------
 def registrar_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Registra el usuario en función del chat en el que se encuentre.
-    Se guarda en context.bot_data un diccionario con la relación chat_id -> datos del usuario.
-    """
     chat = update.effective_chat
     user = update.effective_user
+    # Si el trabajador envía un contacto, usamos el teléfono; de lo contrario, usamos el nombre completo
+    if update.message and update.message.contact:
+        worker_id = update.message.contact.phone_number
+    else:
+        worker_id = user.full_name if user.full_name else user.username
     if "usuarios" not in context.bot_data:
         context.bot_data["usuarios"] = {}
     context.bot_data["usuarios"][chat.id] = {
-        "user_id": user.id,
+        "worker_id": worker_id,  # Este es el identificador que se usará en las transacciones
         "username": user.username,
         "full_name": user.full_name,
         "chat_type": chat.type,
     }
-    logger.info("Registrado usuario %s en el chat %s", user.full_name, chat.id)
+    logger.info("Registrado trabajador %s en el chat %s", worker_id, chat.id)
 
 # -----------------------
-# Funciones utilitarias
+# Funciones utilitarias y de formato
 # -----------------------
 def parse_command_arguments(text: str, command: str) -> list:
     return shlex.split(text[len(command):].strip())
 
-def obtener_historial_text(user_id: str) -> str:
-    df = obtener_historial_df(user_id)
-    if df.empty:
-        return "📭 No hay registros en el historial"
-    df['cantidad'] = df['cantidad'].apply(lambda x: f"{x}")
-    df['precio'] = df['precio'].apply(lambda x: f"${x:,.2f}")
-    return pd.DataFrame.to_string(
-        df[['tipo', 'producto', 'cantidad', 'unidad', 'precio', 'cliente', 'notas', 'fecha']],
-        index=False
+def formatear_transaccion(tx: dict) -> str:
+    """Genera un string HTML formateado para una transacción."""
+    cliente_label = "Cliente" if tx.get("tipo", "").lower() == "venta" else "Proveedor"
+    return (
+        f"<b>ID:</b> {tx.get('id', 'N/A')}\n"
+        f"<b>Tipo:</b> {tx.get('tipo', 'N/A').capitalize()}\n"
+        f"<b>Producto:</b> {tx.get('producto', 'N/A')}\n"
+        f"<b>Cantidad:</b> {tx.get('cantidad', 'N/A')} {tx.get('unidad', '')}\n"
+        f"<b>Precio:</b> ${float(tx.get('precio', 0)):.2f}\n"
+        f"<b>{cliente_label}:</b> {tx.get('cliente', 'N/A')}\n"
+        f"<b>Notas:</b> {tx.get('notas', 'Ninguna')}\n"
+        f"<b>Fecha:</b> {tx.get('fecha', 'N/A')}\n"
     )
 
-def obtener_ultimo_transaccion(user_id: str) -> dict:
-    df = obtener_historial_df(user_id)
+def formatear_historial(df: pd.DataFrame) -> str:
+    """Convierte un DataFrame de transacciones en un string HTML bien formateado."""
     if df.empty:
-        return {}
-    return df.iloc[0].to_dict()
+        return "📭 No hay registros en el historial."
+    mensajes = []
+    # Limitar a los 5 registros más recientes para no saturar la pantalla
+    for _, row in df.head(5).iterrows():
+        tx = row.to_dict()
+        mensajes.append(formatear_transaccion(tx))
+    return "\n".join(mensajes)
 
 def calcular_ganancias(user_id: str) -> dict:
     with sqlite3.connect(DATABASE_PATH) as conn:
@@ -104,6 +115,66 @@ def calcular_ganancias(user_id: str) -> dict:
             compras = total if total is not None else 0.0
     return {'ventas': ventas, 'compras': compras, 'neto': ventas - compras}
 
+def obtener_ultimo_transaccion(user_id: str) -> dict:
+    df = obtener_historial_df(user_id)
+    if df.empty:
+        return {}
+    return df.iloc[0].to_dict()
+
+def obtener_desglose_ganancias(user_id: str) -> pd.DataFrame:
+    """
+    Retorna un DataFrame pivot que muestra el total (cantidad*precio) 
+    por producto y tipo (venta/compra) para el usuario.
+    """
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        query = """
+            SELECT producto, tipo, SUM(cantidad*precio) as total
+            FROM transacciones
+            WHERE usuario = ?
+            GROUP BY producto, tipo
+        """
+        df = pd.read_sql_query(query, conn, params=(user_id,))
+    if df.empty:
+        return df
+    pivot = df.pivot(index='producto', columns='tipo', values='total').fillna(0)
+    return pivot
+
+def generar_grafica_ganancias(user_id: str) -> str:
+    """
+    Genera una gráfica de barras agrupadas a partir del desglose de ganancias.
+    Retorna el nombre del archivo temporal con la imagen.
+    """
+    pivot = obtener_desglose_ganancias(user_id)
+    if pivot.empty:
+        return None
+    fig, ax = plt.subplots()
+    pivot.plot(kind='bar', ax=ax)
+    ax.set_ylabel("Total en $")
+    ax.set_title("Desglose de Ganancias por Producto y Tipo")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    plt.savefig(temp_file.name)
+    plt.close(fig)
+    return temp_file.name
+
+def generar_grafica_inventario() -> str:
+    """
+    Genera una gráfica de pastel a partir del inventario para mostrar la distribución 
+    de cantidades por producto. Retorna el nombre del archivo temporal con la imagen.
+    """
+    df = obtener_inventario_df()
+    if df.empty:
+        return None
+    fig, ax = plt.subplots()
+    ax.pie(df['cantidad'], labels=df['producto'], autopct='%1.1f%%', startangle=90)
+    ax.set_title("Distribución del Inventario")
+    plt.tight_layout()
+    temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    plt.savefig(temp_file.name)
+    plt.close(fig)
+    return temp_file.name
+
 # -----------------------
 # Comandos básicos
 # -----------------------
@@ -123,9 +194,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "▫️ /compra - Inicia un asistente interactivo para registrar una compra.\n"
         "▫️ /modificar - Inicia un asistente para modificar una transacción.\n"
         "▫️ /eliminar - Elimina una transacción (se confirma con botones).\n"
-        "▫️ /ganancias - Muestra el balance financiero.\n"
+        "▫️ /ganancias - Muestra el balance financiero y desglose por producto.\n"
         "▫️ /historial - Muestra las transacciones recientes.\n"
-        "▫️ /inventario - Muestra todo el inventario.\n"
+        "▫️ /inventario - Muestra el inventario con una gráfica de pastel.\n"
         "▫️ /exportar_historial - Exporta el historial a Excel.\n"
         "▫️ /filtrar_historial <dia|mes> <valor> - Filtra el historial.\n"
         "▫️ /ultimo_pedido - Muestra la última transacción.\n"
@@ -138,19 +209,28 @@ async def ganancias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         user_id = str(update.message.from_user.id)
         ganancia = calcular_ganancias(user_id)
-        respuesta = (
-            f"📊 Balance Financiero:\n"
-            f"Total Ventas: ${ganancia['ventas']:.2f}\n"
-            f"Total Compras: ${ganancia['compras']:.2f}\n"
-            f"Ganancias Netas: ${ganancia['neto']:.2f}"
+        mensaje = (
+            f"<b>📊 Balance Financiero:</b>\n"
+            f"<b>Total Ventas:</b> ${ganancia['ventas']:.2f}\n"
+            f"<b>Total Compras:</b> ${ganancia['compras']:.2f}\n"
+            f"<b>Ganancias Netas:</b> ${ganancia['neto']:.2f}\n\n"
         )
-        await update.message.reply_text(respuesta)
+        pivot = obtener_desglose_ganancias(user_id)
+        if pivot.empty:
+            mensaje += "No hay desglose por producto disponible."
+        else:
+            mensaje += "<b>Desglose por Producto:</b>\n<pre>" + pivot.to_string() + "</pre>"
+        await update.message.reply_text(mensaje, parse_mode='HTML')
+        grafica = generar_grafica_ganancias(user_id)
+        if grafica:
+            await update.message.reply_photo(photo=open(grafica, "rb"))
+            os.remove(grafica)
     except Exception as e:
         logger.error(f"Error en ganancias: {str(e)}", exc_info=True)
         await update.message.reply_text("❌ Error obteniendo balance financiero")
 
 # -----------------------
-# Función para ver el inventario
+# Función para ver el inventario (con gráfica de pastel)
 # -----------------------
 async def inventario(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -163,6 +243,10 @@ async def inventario(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         keyboard = [[InlineKeyboardButton("Actualizar", callback_data="refrescar_inventario")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(mensaje, parse_mode='HTML', reply_markup=reply_markup)
+        grafica = generar_grafica_inventario()
+        if grafica:
+            await update.message.reply_photo(photo=open(grafica, "rb"))
+            os.remove(grafica)
     except Exception as e:
         logger.error(f"Error mostrando inventario: {str(e)}", exc_info=True)
         await update.message.reply_text("❌ Error al mostrar el inventario.")
@@ -184,7 +268,6 @@ async def refrescar_inventario(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # -----------------------
 # Flujo de conversación para VENTA
-# Nuevo orden: Producto → Cantidad → Unidad → Precio → Cliente → Nota → Confirmar
 # -----------------------
 V_PRODUCTO, V_CANTIDAD, V_UNIDAD, V_PRECIO, V_CLIENTE, V_NOTA, V_CONFIRM = range(7)
 
@@ -212,10 +295,8 @@ async def venta_cantidad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return V_CANTIDAD
     context.user_data['cantidad'] = cantidad
     reply_keyboard = [["kilos", "toneladas", "cajas"]]
-    await update.message.reply_text(
-        "Selecciona la unidad:",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-    )
+    await update.message.reply_text("Selecciona la unidad:",
+                                    reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
     return V_UNIDAD
 
 async def venta_unidad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -246,13 +327,13 @@ async def venta_nota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     nota = update.message.text.strip()
     context.user_data['nota'] = "" if nota.lower() == "omitir" else nota
     resumen = (
-        f"Por favor, confirma la siguiente información:\n\n"
-        f"Tipo: Venta\n"
-        f"Producto: {context.user_data['producto']}\n"
-        f"Cantidad: {context.user_data['cantidad']} {context.user_data['unidad']}\n"
-        f"Precio: ${context.user_data['precio']:.2f}\n"
-        f"Cliente: {context.user_data['cliente'] or 'No especificado'}\n"
-        f"Nota: {context.user_data['nota'] or 'Ninguna'}\n\n"
+        f"<b>Confirma la siguiente información:</b>\n\n"
+        f"<b>Tipo:</b> Venta\n"
+        f"<b>Producto:</b> {context.user_data['producto']}\n"
+        f"<b>Cantidad:</b> {context.user_data['cantidad']} {context.user_data['unidad']}\n"
+        f"<b>Precio:</b> ${context.user_data['precio']:.2f}\n"
+        f"<b>Cliente:</b> {context.user_data['cliente'] or 'No especificado'}\n"
+        f"<b>Nota:</b> {context.user_data['nota'] or 'Ninguna'}\n\n"
         "¿Confirmas la transacción?"
     )
     keyboard = [
@@ -260,17 +341,17 @@ async def venta_nota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
          InlineKeyboardButton("Cancelar", callback_data="cancelar_venta")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(resumen, reply_markup=reply_markup)
+    await update.message.reply_text(resumen, reply_markup=reply_markup, parse_mode='HTML')
     return V_CONFIRM
 
 async def venta_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     try:
-        user_id = str(query.from_user.id)
-        registrado_por = query.from_user.username or user_id
+        chat = query.message.chat
+        worker_id = context.bot_data["usuarios"].get(chat.id, {}).get("worker_id", "")
         transaccion_id = agregar_transaccion(
-            registrado_por,
+            worker_id,  # Se utiliza el identificador del trabajador
             "venta",
             context.user_data['producto'],
             context.user_data['cantidad'],
@@ -284,13 +365,10 @@ async def venta_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.clear()
         return ConversationHandler.END
     respuesta = (
-        f"✅ Venta registrada:\n"
-        f"Producto: {context.user_data['producto']}\n"
-        f"Cantidad: {context.user_data['cantidad']} {context.user_data['unidad']}\n"
-        f"Precio: ${context.user_data['precio']:.2f}\n"
-        f"ID: {transaccion_id}"
+        f"<b>✅ Venta registrada:</b>\n"
+        f"{formatear_transaccion({'id': transaccion_id, 'tipo': 'venta', 'producto': context.user_data['producto'], 'cantidad': context.user_data['cantidad'], 'unidad': context.user_data['unidad'], 'precio': context.user_data['precio'], 'cliente': context.user_data['cliente'] or 'No especificado', 'notas': context.user_data['nota'], 'fecha': datetime.now().strftime('%d/%m/%Y %I:%M%p')})}"
     )
-    await query.edit_message_text(respuesta)
+    await query.edit_message_text(respuesta, parse_mode='HTML')
     await enviar_informe_inventario(query, context.user_data['producto'])
     context.user_data.clear()
     return ConversationHandler.END
@@ -302,7 +380,6 @@ async def venta_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 # -----------------------
 # Flujo de conversación para COMPRA
-# Nuevo orden: Producto → Cantidad → Unidad → Precio → Proveedor → Nota → Confirmar
 # -----------------------
 C_PRODUCTO, C_CANTIDAD, C_UNIDAD, C_PRECIO, C_CLIENTE, C_NOTA, C_CONFIRM = range(7)
 
@@ -330,10 +407,8 @@ async def compra_cantidad(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return C_CANTIDAD
     context.user_data['cantidad'] = cantidad
     reply_keyboard = [["kilos", "toneladas", "cajas"]]
-    await update.message.reply_text(
-        "Selecciona la unidad:",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-    )
+    await update.message.reply_text("Selecciona la unidad:",
+                                    reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True))
     return C_UNIDAD
 
 async def compra_unidad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -364,13 +439,13 @@ async def compra_nota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     nota = update.message.text.strip()
     context.user_data['nota'] = "" if nota.lower() == "omitir" else nota
     resumen = (
-        f"Por favor, confirma la siguiente información:\n\n"
-        f"Tipo: Compra\n"
-        f"Producto: {context.user_data['producto']}\n"
-        f"Cantidad: {context.user_data['cantidad']} {context.user_data['unidad']}\n"
-        f"Precio: ${context.user_data['precio']:.2f}\n"
-        f"Proveedor: {context.user_data['cliente'] or 'No especificado'}\n"
-        f"Nota: {context.user_data['nota'] or 'Ninguna'}\n\n"
+        f"<b>Confirma la siguiente información:</b>\n\n"
+        f"<b>Tipo:</b> Compra\n"
+        f"<b>Producto:</b> {context.user_data['producto']}\n"
+        f"<b>Cantidad:</b> {context.user_data['cantidad']} {context.user_data['unidad']}\n"
+        f"<b>Precio:</b> ${context.user_data['precio']:.2f}\n"
+        f"<b>Proveedor:</b> {context.user_data['cliente'] or 'No especificado'}\n"
+        f"<b>Nota:</b> {context.user_data['nota'] or 'Ninguna'}\n\n"
         "¿Confirmas la transacción?"
     )
     keyboard = [
@@ -378,17 +453,17 @@ async def compra_nota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
          InlineKeyboardButton("Cancelar", callback_data="cancelar_compra")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(resumen, reply_markup=reply_markup)
+    await update.message.reply_text(resumen, reply_markup=reply_markup, parse_mode='HTML')
     return C_CONFIRM
 
 async def compra_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     try:
-        user_id = str(query.from_user.id)
-        registrado_por = query.from_user.username or user_id
+        chat = query.message.chat
+        worker_id = context.bot_data["usuarios"].get(chat.id, {}).get("worker_id", "")
         transaccion_id = agregar_transaccion(
-            registrado_por,
+            worker_id,  # Se utiliza el identificador del trabajador
             "compra",
             context.user_data['producto'],
             context.user_data['cantidad'],
@@ -402,13 +477,10 @@ async def compra_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data.clear()
         return ConversationHandler.END
     respuesta = (
-        f"✅ Compra registrada:\n"
-        f"Producto: {context.user_data['producto']}\n"
-        f"Cantidad: {context.user_data['cantidad']} {context.user_data['unidad']}\n"
-        f"Precio: ${context.user_data['precio']:.2f}\n"
-        f"ID: {transaccion_id}"
+        f"<b>✅ Compra registrada:</b>\n"
+        f"{formatear_transaccion({'id': transaccion_id, 'tipo': 'compra', 'producto': context.user_data['producto'], 'cantidad': context.user_data['cantidad'], 'unidad': context.user_data['unidad'], 'precio': context.user_data['precio'], 'cliente': context.user_data['cliente'] or 'No especificado', 'notas': context.user_data['nota'], 'fecha': datetime.now().strftime('%d/%m/%Y %I:%M%p')})}"
     )
-    await query.edit_message_text(respuesta)
+    await query.edit_message_text(respuesta, parse_mode='HTML')
     await enviar_informe_inventario(query, context.user_data['producto'])
     context.user_data.clear()
     return ConversationHandler.END
@@ -419,8 +491,7 @@ async def compra_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 # -----------------------
-# Flujo de conversación para MODIFICAR
-# (Se mantiene igual que en el código base)
+# Flujo de conversación para MODIFICAR (se mantiene igual)
 # -----------------------
 M_ID, M_PRODUCTO, M_CANTIDAD, M_PRECIO, M_CLIENTE, M_NOTA, M_UNIDAD, M_CONFIRM = range(8)
 
@@ -487,27 +558,27 @@ async def modificar_nota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def modificar_unidad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     unidad = update.message.text.strip().lower()
     context.user_data['unidad'] = None if unidad.lower() == "omitir" else unidad
-    resumen = "Por favor, confirma la siguiente modificación:\n\n"
-    resumen += f"ID: {context.user_data['transaccion_id']}\n"
+    resumen = "<b>Confirma la siguiente modificación:</b>\n\n"
+    resumen += f"<b>ID:</b> {context.user_data['transaccion_id']}\n"
     if context.user_data['producto'] is not None:
-        resumen += f"Nuevo producto: {context.user_data['producto']}\n"
+        resumen += f"<b>Nuevo producto:</b> {context.user_data['producto']}\n"
     if context.user_data['cantidad'] is not None:
-        resumen += f"Nueva cantidad: {context.user_data['cantidad']}\n"
+        resumen += f"<b>Nueva cantidad:</b> {context.user_data['cantidad']}\n"
     if context.user_data['precio'] is not None:
-        resumen += f"Nuevo precio: ${context.user_data['precio']:.2f}\n"
+        resumen += f"<b>Nuevo precio:</b> ${context.user_data['precio']:.2f}\n"
     if context.user_data['cliente'] is not None:
-        resumen += f"Nuevo cliente/proveedor: {context.user_data['cliente']}\n"
+        resumen += f"<b>Nuevo cliente/proveedor:</b> {context.user_data['cliente']}\n"
     if context.user_data['nota'] is not None:
-        resumen += f"Nueva nota: {context.user_data['nota']}\n"
+        resumen += f"<b>Nueva nota:</b> {context.user_data['nota']}\n"
     if context.user_data['unidad'] is not None:
-        resumen += f"Nueva unidad: {context.user_data['unidad']}\n"
+        resumen += f"<b>Nueva unidad:</b> {context.user_data['unidad']}\n"
     resumen += "\n¿Confirmas la modificación?"
     keyboard = [
         [InlineKeyboardButton("Confirmar", callback_data="confirmar_modificar"),
          InlineKeyboardButton("Cancelar", callback_data="cancelar_modificar")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(resumen, reply_markup=reply_markup)
+    await update.message.reply_text(resumen, reply_markup=reply_markup, parse_mode='HTML')
     return M_CONFIRM
 
 async def modificar_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -563,20 +634,16 @@ async def eliminar_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await update.message.reply_text("ℹ️ No hay transacciones recientes")
                 return ConversationHandler.END
             context.user_data['transaccion_a_eliminar'] = ultimo['id']
+            mensaje = (
+                "<b>⚠️ Confirmar eliminación:</b>\n\n" +
+                formatear_transaccion(ultimo)
+            )
             keyboard = [
                 [InlineKeyboardButton("Confirmar", callback_data="confirmar_eliminar"),
                  InlineKeyboardButton("Cancelar", callback_data="cancelar_eliminar")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                f"⚠️ Confirmar eliminación:\n\n"
-                f"ID: {ultimo['id']}\n"
-                f"Tipo: {ultimo['tipo'].capitalize()}\n"
-                f"Producto: {ultimo['producto']}\n"
-                f"Cantidad: {ultimo['cantidad']} {ultimo['unidad']}\n"
-                f"Precio: ${ultimo['precio']:.2f}",
-                reply_markup=reply_markup
-            )
+            await update.message.reply_text(mensaje, reply_markup=reply_markup, parse_mode='HTML')
             return CONFIRMAR_ELIMINAR
     except Exception as e:
         logger.error(f"Error en eliminación: {str(e)}", exc_info=True)
@@ -610,8 +677,8 @@ async def enviar_informe_inventario(update: Update, producto: str) -> None:
         if df_producto.empty:
             informe = f"📦 No hay información de inventario para el producto '{producto}'."
         else:
-            informe = f"📦 Inventario actual para {producto}:\n" + df_producto.to_string(index=False)
-        await update.message.reply_text(informe)
+            informe = f"<b>📦 Inventario actual para {producto}:</b>\n<pre>{df_producto.to_string(index=False)}</pre>"
+        await update.message.reply_text(informe, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error al enviar informe de inventario: {str(e)}", exc_info=True)
         await update.message.reply_text(f"❌ Error al enviar informe de inventario: {str(e)}")
@@ -619,8 +686,9 @@ async def enviar_informe_inventario(update: Update, producto: str) -> None:
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         user_id = str(update.message.from_user.id)
-        historial_str = obtener_historial_text(user_id)
-        await update.message.reply_text(f"📜 Historial reciente:\n\n{historial_str}")
+        df = obtener_historial_df(user_id)
+        mensaje = f"<b>📜 Historial reciente:</b>\n\n{formatear_historial(df)}"
+        await update.message.reply_text(mensaje, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error en historial: {str(e)}", exc_info=True)
         await update.message.reply_text("❌ Error obteniendo historial")
@@ -677,20 +745,10 @@ async def ultimo_pedido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         user_id = str(update.message.from_user.id)
         ultimo = obtener_ultimo_transaccion(user_id)
         if ultimo:
-            mensaje = (
-                f"📌 Último Pedido:\n"
-                f"Tipo: {ultimo['tipo'].capitalize()}\n"
-                f"Producto: {ultimo['producto']}\n"
-                f"Cantidad: {ultimo['cantidad']} {ultimo['unidad']}\n"
-                f"Precio: ${ultimo['precio']:.2f}\n"
-                f"{'Cliente' if ultimo['tipo']=='venta' else 'Proveedor'}: {ultimo['cliente']}\n"
-                f"Notas: {ultimo['notas']}\n"
-                f"Fecha: {ultimo['fecha']}\n"
-                f"ID: {ultimo['id']}"
-            )
+            mensaje = "<b>📌 Último Pedido:</b>\n\n" + formatear_transaccion(ultimo)
         else:
             mensaje = "ℹ️ No hay transacciones recientes."
-        await update.message.reply_text(mensaje)
+        await update.message.reply_text(mensaje, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error en último pedido: {str(e)}", exc_info=True)
         await update.message.reply_text("❌ Error obteniendo el último pedido")
@@ -719,66 +777,88 @@ async def corte(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def auto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Verificar que el mensaje y su texto existan
+        if not update.message or not update.message.text:
+            return
+
         user_id = str(update.message.from_user.id)
-        mensaje = update.message.text
-        registrado_por = update.message.from_user.username or user_id
+        mensaje = update.message.text.strip()
+        chat = update.message.chat
+
+        # Extraer el worker_id registrado en el chat; si no existe, usar username o user_id
+        registrado_por = context.bot_data.get("usuarios", {}).get(chat.id, {}).get(
+            "worker_id", update.message.from_user.username or user_id
+        )
+
+        # Procesar el mensaje usando el analizador, que debe retornar un array de acciones
         acciones = analizar_mensaje(user_id, registrado_por, mensaje)
         if not acciones:
             await update.message.reply_text("❌ No se detectaron acciones en el mensaje.")
             return
+
         respuestas_procesadas = []
         for accion in acciones:
+            # Si se detecta un error en la acción, se añade a las respuestas y se continúa
             if "error" in accion:
                 respuestas_procesadas.append(f"❌ Error: {accion['error']}")
                 continue
-            cliente = accion.get('cliente', '') or ''
-            nota = accion.get('nota', '') or ''
-            unidad = accion.get('unidad', 'unidades')
-            transaccion_id = accion.get('transaccion_id', '')
-            tipo = accion.get('tipo', '').lower()
-            producto = accion.get('producto', '')
+
             try:
-                cantidad = float(accion['cantidad'])
-                precio = float(accion['precio'])
+                # Convertir cantidad y precio a float
+                cantidad = float(accion.get('cantidad', 0))
+                precio = float(accion.get('precio', 0))
             except Exception as conv_err:
                 logger.error(f"Error al convertir cantidad/precio: {conv_err}")
                 respuestas_procesadas.append("❌ Error en datos numéricos")
                 continue
-            if not transaccion_id:
-                transaccion_id = str(uuid.uuid4())
+
+            # Si no se especifica un transaccion_id, se genera uno nuevo
+            transaccion_id = accion.get('transaccion_id') or str(uuid.uuid4())
+
+            # Evitar acciones duplicadas
             if ContextManager.is_action_id_registered(user_id, transaccion_id):
                 respuestas_procesadas.append(f"⚠️ Acción duplicada: {transaccion_id}")
                 continue
+
+            # Extraer datos, usando empty string si algún campo es None, y limpiar espacios
+            tipo = (accion.get('tipo') or '').strip().lower()
+            producto = (accion.get('producto') or '').strip()
+            unidad = (accion.get('unidad') or 'unidades').strip()
+            cliente = (accion.get('cliente') or '').strip()
+            nota = (accion.get('nota') or '').strip()
+
             try:
-                if tipo in ["venta", "compra"]:
-                    agregar_transaccion(
-                        registrado_por,
-                        tipo,
-                        producto,
-                        cantidad,
-                        unidad,
-                        precio,
-                        cliente,
-                        nota,
-                        None,
-                        transaccion_id
-                    )
-                    ContextManager.add_action_id(user_id, transaccion_id)
-                    respuesta = (
-                        f"✅ {'Venta' if tipo == 'venta' else 'Compra'} registrada:\n"
-                        f"• Producto: {producto}\n"
-                        f"• Cantidad: {cantidad} {unidad}\n"
-                        f"• Precio unitario: ${precio:.2f}\n"
-                        f"• ID: {transaccion_id}"
-                    )
-                    respuestas_procesadas.append(respuesta)
-                    await enviar_informe_inventario(update, producto)
-                else:
-                    respuestas_procesadas.append(f"⚠️ Acción no soportada: {tipo}")
+                # Registrar la transacción en la base de datos
+                agregar_transaccion(
+                    registrado_por,
+                    tipo,
+                    producto,
+                    cantidad,
+                    unidad,
+                    precio,
+                    cliente,
+                    nota,
+                    None,
+                    transaccion_id
+                )
+                ContextManager.add_action_id(user_id, transaccion_id)
+                accion_texto = (
+                    f"<b>✅ {'Venta' if tipo == 'venta' else 'Compra'} registrada:</b>\n"
+                    f"• Producto: {producto}\n"
+                    f"• Cantidad: {cantidad} {unidad}\n"
+                    f"• Precio unitario: ${precio:.2f}\n"
+                    f"• ID: {transaccion_id}"
+                )
+                respuestas_procesadas.append(accion_texto)
+                # Enviar el informe de inventario del producto involucrado
+                await enviar_informe_inventario(update, producto)
             except ValueError as ve:
+                logger.error(f"Error registrando acción: {ve}", exc_info=True)
                 respuestas_procesadas.append(f"❌ Error: {str(ve)}")
                 await enviar_informe_inventario(update, producto)
-        await update.message.reply_text("\n".join(respuestas_procesadas))
+
+        if respuestas_procesadas:
+            await update.message.reply_text("\n\n".join(respuestas_procesadas), parse_mode='HTML')
     except Exception as e:
         logger.error(f"❌ Error en auto_handler: {str(e)}", exc_info=True)
         await update.message.reply_text("❌ Error procesando tu mensaje")

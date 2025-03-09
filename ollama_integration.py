@@ -64,14 +64,15 @@ class ContextManager:
         return accion_id in context['accion_ids']
 
 # Actualizamos el prompt para incluir el campo "nota"
-system_prompt = """Eres un asistente comercial. Responde EXCLUSIVAMENTE con UN JSON que contenga:
+system_prompt = """Eres un asistente comercial. Tu única tarea es interpretar los mensajes del usuario para extraer **acciones** (ventas, compras, etc.) y responder **exclusivamente** con **un JSON** que contenga **exactamente** estos parámetros:
+
 {
     "acciones": [
         {
             "tipo": "venta|compra|modificar|eliminar",
             "producto": "nombre_especifico",
             "cantidad": número,
-            "precio": número, 
+            "precio": número,
             "unidad": "kg|unidades|litros|toneladas|cajas",
             "cliente": "nombre (opcional)",
             "nota": "texto (opcional)",
@@ -80,9 +81,31 @@ system_prompt = """Eres un asistente comercial. Responde EXCLUSIVAMENTE con UN J
     ]
 }
 
-¡NO INCLUYAS NINGÚN TEXTO EXTRA FUERA DEL JSON!
-¡NO USES MARKDOWN, BLOQUES DE CÓDIGO O TEXTO EXTRA! Solo el JSON puro.
-ES ESTRICTA LA ESTRUCTURA, NO PUEDES CAMBIAR LOS NOMBRES USA EXACTAMENTE ESOS NOMBRES"""
+**REGLAS IMPORTANTES**:
+1. **No incluyas texto extra fuera del JSON** (ni bloques de código, ni explicaciones, ni texto en Markdown).  
+2. **Usa la estructura y los nombres exactamente como se muestran**. No cambies "acciones", ni los nombres de los campos.  
+3. **No uses otras llaves ni campos** que no estén en la plantilla.  
+4. **Si el usuario menciona varias acciones** (por ejemplo: “Vendí 10 kg de maíz… y compré 20 kg de frijol… además vendí 5 kg de arroz…”), **devuelve un arreglo con múltiples objetos** en la clave `"acciones"`.  
+5. **Si el usuario menciona una sola acción**, devuelve un solo objeto en `"acciones"`.  
+6. El campo `"transaccion_id"` se usa solo para modificar/eliminar. Si no se usa, puede ir vacío o en null.  
+7. **No incluyas** ningún texto adicional fuera del JSON. **El JSON debe ser la única salida**.
+
+**EJEMPLOS**:
+1. **Mensaje múltiple**: “Vendí 10 kg de maíz a $5/kg a Juan y compré 20 kg de frijol a $3.5/kg a Pedro, además vendí 5 kg de arroz a $2/kg a María.”  
+   - Tu salida (JSON) deberá contener 3 objetos en `"acciones"`: uno para la venta de maíz, uno para la compra de frijol y uno para la venta de arroz.
+
+2. **Mensaje único**: “Vendí 2 toneladas de elote para Juan, le cobré 1900$ por tonelada nota: que sea de calidad.”  
+   - Tu salida (JSON) deberá contener 1 objeto en `"acciones"` con `"tipo": "venta"`, `"producto": "elote"`, `"cantidad": 2`, `"precio": 1900`, `"unidad": "toneladas"`, `"cliente": "Juan"`, `"nota": "que sea de calidad"`, `"transaccion_id": ""` o `null`.
+
+**Recuerda**: 
+- El JSON es **estricto**.  
+- **No** uses Markdown ni texto extra.  
+- **No** incluyas tildes en los campos clave (por ejemplo, no cambies `"transaccion_id"` por `"transacción_id"`).  
+- Si el usuario pide modificar/eliminar, incluye el `"transaccion_id"` apropiado.  
+
+SIGUE ESTAS INSTRUCCIONES **AL PIE DE LA LETRA** Y **NO AÑADAS** MÁS DETALLES FUERA DEL JSON.
+
+"""
 
 def repair_json(response: str) -> List[Dict]:
     """Repara JSON fragmentado y extrae múltiples JSON en caso de respuesta incompleta."""
